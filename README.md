@@ -1,16 +1,8 @@
 # SphereDiff: Tuning-free 360° Static and Dynamic Panorama Generation via Spherical Latent Representation
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2504.14396">
-    <img src="https://img.shields.io/badge/arXiv-2504.14396-b31b1b.svg" alt="arXiv">
-  </a>
-  <a href="https://pmh9960.github.io/SphereDiff/">
-    <img src="https://img.shields.io/badge/Project_Page-Visit-blue.svg" alt="Project Page">
-  </a>
-  <a href="https://github.com/pmh9960/SphereDiff">
-    <img src="https://img.shields.io/badge/Code-GitHub-black.svg?logo=github" alt="Code">
-  </a>
-</p>
+[![arXiv](https://img.shields.io/badge/arXiv-2504.14396-b31b1b.svg)](https://arxiv.org/abs/2504.14396)
+[![GitHub Code](https://img.shields.io/badge/Code-GitHub-black.svg?logo=github)](https://github.com/pmh9960/SphereDiff)
+[![Project Page](https://img.shields.io/badge/Project_Page-Visit-blue.svg)](https://pmh9960.github.io/SphereDiff)
 
 > [Minho Park\*](https://pmh9960.github.io/), [Taewoong Kang\*](https://keh0t0.github.io/), [Jooyeol Yun](https://yeolj00.github.io/), [Sungwon Hwang](https://deepshwang.github.io/) and [Jaegul Choo](https://sites.google.com/site/jaegulchoo/)  
 > Korea Advanced Institute of Science and Technology (KAIST)  
