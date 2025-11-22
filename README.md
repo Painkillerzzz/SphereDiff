@@ -1,11 +1,10 @@
-# SphereDiff: Tuning-free 360° Static and Live Wallpaper Generation via Spherical Latent Representation
+# SphereDiff: Tuning-free 360° Static and Dynamic Panorama Generation via Spherical Latent Representation
 
-<!-- [Paper](https://arxiv.org/abs/2504.14396) | [Project page](https://pmh9960.github.io/research/SphereDiff/) | [Code](https://github.com/pmh9960/SphereDiff) -->
 <p align="center">
   <a href="https://arxiv.org/abs/2504.14396">
     <img src="https://img.shields.io/badge/arXiv-2504.14396-b31b1b.svg" alt="arXiv">
   </a>
-  <a href="https://pmh9960.github.io/research/SphereDiff/">
+  <a href="https://pmh9960.github.io/SphereDiff/">
     <img src="https://img.shields.io/badge/Project_Page-Visit-blue.svg" alt="Project Page">
   </a>
   <a href="https://github.com/pmh9960/SphereDiff">
@@ -15,17 +14,17 @@
 
 > [Minho Park\*](https://pmh9960.github.io/), [Taewoong Kang\*](https://keh0t0.github.io/), [Jooyeol Yun](https://yeolj00.github.io/), [Sungwon Hwang](https://deepshwang.github.io/) and [Jaegul Choo](https://sites.google.com/site/jaegulchoo/)  
 > Korea Advanced Institute of Science and Technology (KAIST)  
-> arXiv 2025. (\* indicate equal contribution)
+> AAAI 2026 (Oral). (\* indicate equal contribution)
 
 ## 🌐 Overview
 
-**SphereDiff** enables **tuning-free generation of 360° panoramic images and live wallpapers** using pretrained diffusion models.  
+**SphereDiff** enables **tuning-free generation of 360° panoramic images and videos** using pretrained diffusion models.  
 Unlike ERP-based methods, SphereDiff defines a **spherical latent representation** to maintain consistent quality across all viewing directions.
 
 **Key features:**
 
 - 🌍 Spherical latent representation for distortion-free 360° generation
-- 🌀 Supports both **static** and **live (animated)** wallpapers
+- 🌀 Supports both **static** and **dynamic** panoramas
 - ⚙️ Plug-and-play with existing pretrained diffusion models
 - 💡 No additional fine-tuning required
 
@@ -33,7 +32,7 @@ Unlike ERP-based methods, SphereDiff defines a **spherical latent representation
 
 ![teaser](./assets/teaser.png)
 
-> Generated 360° Static and Live Wallpapers with Diverse Diffusion Backbones.
+> Generated 360° Static and Dynamic Panoramas with Diverse Diffusion Backbones.
 
 ## 🚀 Example Usage
 
@@ -77,9 +76,9 @@ python generate_static_wallpaper.py --config_add ${default_config} call_kwargs.p
 
 ## 🚧 Planned Updates
 
-- [ ] Update the project page and arXiv link  
+- [x] Update the project page and arXiv link  
+- [x] Release the base code for static & live wallpaper generation  
 - [ ] Release the code for foreground–background generation  
-- [x] Release the base code for static & live wallpaper generation
 
 ## 📚 Citation
 
