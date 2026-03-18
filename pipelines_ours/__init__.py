@@ -1,3 +1,4 @@
+from .pipeline_perspective_to_panorama_flux import PerspectiveToPanoramaFluxPipeline
 from .pipeline_spherical_flux import SphericalFluxPipeline
 from .pipeline_spherical_hunyuan_video import SphericalHunyuanVideoPipeline
 from .pipeline_spherical_ltx_video import SphericalLTXPipeline
