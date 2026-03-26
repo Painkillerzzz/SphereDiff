@@ -146,6 +146,11 @@ class SphericalFluxPipeline(FluxPipeline):
         weighted_average_temperature: float = 0.1,
         erp_height: int = 2048,
         erp_width: int = 4096,
+        use_anisotropic_fov: bool = False,
+        use_adaptive_temperature: bool = False,
+        fibonacci_randomize: bool = False,
+        view_batch_size: int = 1,
+        vae_batch_size: int = 1,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -371,7 +376,7 @@ class SphericalFluxPipeline(FluxPipeline):
         self._num_timesteps = len(timesteps)
 
         num_channels_latents = num_channels_latents * 4
-        spherical_points = SphericalFunctions.fibonacci_sphere(N=n_spherical_points).to(device, dtype=self.dtype)  # (N, 3)
+        spherical_points = SphericalFunctions.fibonacci_sphere(N=n_spherical_points, randomize=fibonacci_randomize).to(device, dtype=self.dtype)  # (N, 3)
         num_points_on_sphere = spherical_points.shape[0]
         shape = (batch_size, num_channels_latents, 1, num_points_on_sphere)
         spherical_points = spherical_points.repeat(batch_size, 1, 1, 1)
@@ -382,6 +387,39 @@ class SphericalFluxPipeline(FluxPipeline):
         multi_prompts_indices_main, fovs_main = SphericalFunctions.get_prompt_indices(view_dir, prompt_dir, prompt_fovs)
 
         print(f'num_points_on_sphere = {num_points_on_sphere}, num_inference_steps_view_dir = {num_inference_steps_view_dir}')
+
+        # --- P2: Anisotropic FOV per view direction based on latitude ---
+        phi_angles = torch.asin(view_dir[:, 1].clamp(-1, 1))  # (V,) in radians
+        if use_anisotropic_fov:
+            view_fovs = []
+            for _j in range(len(view_dir)):
+                phi_abs = phi_angles[_j].abs().item()
+                fov_h = 80.0
+                fov_v = float(max(80.0 * math.cos(phi_abs), 20.0))
+                view_fovs.append((fov_h, fov_v))
+        else:
+            view_fovs = list(fovs_main)
+
+        # --- P1: Adaptive blending temperature per view direction ---
+        if use_adaptive_temperature:
+            phi_normalized = phi_angles.abs() / (math.pi / 2)  # 0 at equator, 1 at poles
+            temperatures_per_view = (0.05 + 0.15 * phi_normalized).tolist()
+        else:
+            temperatures_per_view = [weighted_average_temperature] * len(view_dir)
+
+        # --- P1: Precompute dynamic latent sampling (timestep-invariant) ---
+        print('Precomputing dynamic latent sampling indices...')
+        precomputed_sampling = []
+        for _j in range(len(view_dir)):
+            _cur_view_dir = view_dir[_j].unsqueeze(0)  # (1, 3)
+            _fov_j = view_fovs[_j]
+            _temp_j = temperatures_per_view[_j]
+            _idx_j, _w_j = SphericalFunctions.dynamic_laetent_sampling(
+                spherical_points, _cur_view_dir, num_points_on_sphere, _fov_j,
+                temperature=_temp_j, center_first=False,
+            )
+            precomputed_sampling.append((_idx_j, _w_j))
+        print('Precomputation done.')
 
         latents = randn_tensor(shape, generator, device, dtype=self.dtype)
 
@@ -424,6 +462,23 @@ class SphericalFluxPipeline(FluxPipeline):
                 batch_size * num_images_per_prompt,
             )
 
+        # --- P3a: Precompute view mini-batches grouped by equal patch size ---
+        from collections import defaultdict as _defaultdict
+        _patch_groups = _defaultdict(list)
+        for _j in range(len(view_dir)):
+            _n = precomputed_sampling[_j][0].shape[-1]
+            _patch_groups[_n].append(_j)
+        _view_batches = []
+        for _n, _js in sorted(_patch_groups.items()):
+            for _s in range(0, len(_js), view_batch_size):
+                _view_batches.append(_js[_s:_s + view_batch_size])
+        print(f'P3a: {len(view_dir)} views → {len(_view_batches)} batches (view_batch_size={view_batch_size})')
+        # VAE decode uses its own (typically smaller) batch size to avoid OOM
+        _vae_batches = []
+        for _n, _js in sorted(_patch_groups.items()):
+            for _s in range(0, len(_js), vae_batch_size):
+                _vae_batches.append(_js[_s:_s + vae_batch_size])
+
         # 6. Denoising loop
         n_total = len(view_dir) * len(timesteps)
 
@@ -442,83 +497,97 @@ class SphericalFluxPipeline(FluxPipeline):
             latents_next = torch.zeros_like(latents)
             latents_next_cnt = torch.zeros_like(latents)
 
-            _view_dir = view_dir
             _multi_prompts_indices = multi_prompts_indices_main
 
-            for j_inside in range(len(_view_dir)):
-                if not selected_j_inside(j_inside):
-                    progress_bar.update()
-                    continue
+            if image_embeds is not None:
+                self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
 
-                cur_view_dir = _view_dir[j_inside].repeat(batch_size, 1)  # (B, 3)
-                _fov = fovs_main[j_inside]
+            for _batch in _view_batches:
+                K_b = len(_batch)
+                j0 = _batch[0]
+                indices_0, _ = precomputed_sampling[j0]
+                N_b = indices_0.shape[-1]
+                h_b = round(N_b ** 0.5)
 
-                ### Dynamic Latent Sampling ###
-                indices_new, weight = SphericalFunctions.dynamic_laetent_sampling(
-                    spherical_points, cur_view_dir, num_points_on_sphere, _fov,
-                    temperature=weighted_average_temperature, center_first=False,
-                )
-                cur_latent_height = round(indices_new.shape[-1]**0.5)
-                _latents = latents[..., indices_new]  # (B, C, F, N)
-                _latents = _latents.squeeze(2)
-                _latents = self._pack_latents_for_spherical(_latents, batch_size, num_channels_latents, cur_latent_height, cur_latent_height)
+                # Collect per-view latent patches and prompt embeddings
+                _all_lat = []
+                _all_pe = []
+                _all_ppe = []
+                _all_idx = []
+                _all_w = []
+                for _jj in _batch:
+                    _idx_jj, _w_jj = precomputed_sampling[_jj]
+                    _lat_jj = latents[..., _idx_jj].squeeze(2)  # (B, C, N_b)
+                    _lat_jj = self._pack_latents_for_spherical(
+                        _lat_jj, batch_size, num_channels_latents, h_b, h_b)  # (B, N_b, C)
+                    _all_lat.append(_lat_jj)
+                    _all_pe.append(prompt_embeds[_multi_prompts_indices[_jj]])   # (seq_len, dim)
+                    _all_ppe.append(pooled_prompt_embeds[_multi_prompts_indices[_jj]])  # (pooled_dim,)
+                    _all_idx.append(_idx_jj)
+                    _all_w.append(_w_jj)
 
-                ### Denoising Step ###
-                latent_model_input = _latents
-                latent_model_input = latent_model_input.to(self.dtype)
+                # Build batched inputs (B==1 assumed; generalises trivially)
+                latent_model_input = torch.cat(_all_lat, dim=0).to(self.dtype)  # (K_b, N_b, C)
+                _pe_batch = torch.stack(_all_pe, dim=0)                          # (K_b, seq_len, dim)
+                _ppe_batch = torch.stack(_all_ppe, dim=0)                        # (K_b, pooled_dim)
+                _img_ids_batch = self._prepare_latent_image_ids(
+                    1, h_b, h_b, device, latents.dtype).squeeze(0)              # (N_b, 3) — 2D, transformer broadcasts
+                _timestep_batch = t.expand(K_b).to(latents.dtype)                # (K_b,)
+                _guidance_batch = guidance.expand(K_b) if guidance is not None else None
 
-                if image_embeds is not None:
-                    self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-                # Multi-Prompts: get prompt_embeds and prompt_attention_mask
-                _prompt_embeds = prompt_embeds[_multi_prompts_indices[j_inside]].unsqueeze(dim=0)
-                _pooled_prompt_embeds = pooled_prompt_embeds[_multi_prompts_indices[j_inside]].unsqueeze(dim=0)
-
-                latent_image_ids = self._prepare_latent_image_ids(batch_size, cur_latent_height, cur_latent_height, device, latents.dtype)
-                noise_pred = self.transformer(
+                ### Batched transformer forward (P3a) ###
+                self.scheduler._step_index = None  # ! important
+                noise_pred_batch = self.transformer(
                     hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=_pooled_prompt_embeds,
-                    encoder_hidden_states=_prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    timestep=_timestep_batch / 1000,
+                    guidance=_guidance_batch,
+                    pooled_projections=_ppe_batch,
+                    encoder_hidden_states=_pe_batch,
+                    txt_ids=text_ids,        # (seq_len, 3) — positional-only, same for all
+                    img_ids=_img_ids_batch,  # (K_b, N_b, 3)
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
-                )[0]
+                )[0]  # (K_b, N_b, C)
 
                 if do_true_cfg:
                     if negative_image_embeds is not None:
                         self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
-                    neg_noise_pred = self.transformer(
+                    # neg prompts are a single shared embedding; expand to K_b
+                    _neg_pe_batch = negative_prompt_embeds.expand(K_b, -1, -1)
+                    _neg_ppe_batch = negative_pooled_prompt_embeds.expand(K_b, -1)
+                    self.scheduler._step_index = None
+                    neg_noise_pred_batch = self.transformer(
                         hidden_states=latent_model_input,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        pooled_projections=negative_pooled_prompt_embeds,
-                        encoder_hidden_states=negative_prompt_embeds,
+                        timestep=_timestep_batch / 1000,
+                        guidance=_guidance_batch,
+                        pooled_projections=_neg_ppe_batch,
+                        encoder_hidden_states=_neg_pe_batch,
                         txt_ids=negative_text_ids,
-                        img_ids=latent_image_ids,
+                        img_ids=_img_ids_batch,
                         joint_attention_kwargs=self.joint_attention_kwargs,
                         return_dict=False,
                     )[0]
-                    noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                    noise_pred_batch = neg_noise_pred_batch + true_cfg_scale * (noise_pred_batch - neg_noise_pred_batch)
 
-                # compute the previous noisy sample x_t -> x_t-1
+                # Batched scheduler step (FlowMatch Euler is linear — safe to batch)
                 latents_dtype = latents.dtype
                 self.scheduler._step_index = None  # ! important
-                _latents = self.scheduler.step(noise_pred, t, _latents, return_dict=False)[0]
+                latent_model_input_stepped = self.scheduler.step(
+                    noise_pred_batch, t, latent_model_input, return_dict=False)[0]  # (K_b, N_b, C)
 
-                _latents = self._unpack_latents_for_spherical(_latents, cur_latent_height, cur_latent_height, 1)
-                _latents = rearrange(_latents, 'b c h w -> b c 1 (h w)')
-                for idx_b in range(batch_size):
-                    latents_next[idx_b, ..., indices_new] += _latents[idx_b] * weight
-                    latents_next_cnt[idx_b, ..., indices_new] += weight
+                # Scatter denoised patches back to spherical latents
+                for _k, _jj in enumerate(_batch):
+                    _idx_jj, _w_jj = _all_idx[_k], _all_w[_k]
+                    _lat_out = latent_model_input_stepped[_k:_k + 1]  # (1, N_b, C)
+                    _lat_out = self._unpack_latents_for_spherical(_lat_out, h_b, h_b, 1)  # (1, C, h_b, h_b)
+                    _lat_out = rearrange(_lat_out, 'b c h w -> b c 1 (h w)')
+                    for idx_b in range(batch_size):
+                        latents_next[idx_b, ..., _idx_jj] += _lat_out[idx_b] * _w_jj
+                        latents_next_cnt[idx_b, ..., _idx_jj] += _w_jj
 
-                progress_bar.update()
-                progress_bar.set_description_str(f'i: {i}, j: {j_inside}')
-                progress_bar.set_postfix_str(f'num points = {len(indices_new)}')
+                progress_bar.update(K_b)
+                progress_bar.set_description_str(f'i: {i}, batch_j0: {j0}')
+                progress_bar.set_postfix_str(f'K_b={K_b}, N_b={N_b}')
 
             latents_next_cnt[latents_next_cnt == 0] = 1
             latents = latents_next / latents_next_cnt
@@ -549,40 +618,40 @@ class SphericalFluxPipeline(FluxPipeline):
         wb_cnt = torch.zeros_like(wb)
 
         with self.progress_bar(total=len(view_dir)) as progress_bar:
-            for j_inside in range(len(view_dir)):
-                if not selected_j_inside(j_inside):
-                    progress_bar.update()
-                    continue
+            for _batch in _vae_batches:
+                K_b = len(_batch)
+                j0 = _batch[0]
+                indices_0, _ = precomputed_sampling[j0]
+                N_b = indices_0.shape[-1]
+                h_b = round(N_b ** 0.5)
 
-                cur_view_dir = view_dir[j_inside].repeat(batch_size, 1)  # (B, 3)
-                fov_vae = fovs_main[j_inside]
+                # Build batched VAE input (P3a: same patch size within group)
+                _vae_inputs = []
+                for _jj in _batch:
+                    _idx_jj, _ = precomputed_sampling[_jj]
+                    _lat_jj = latents[..., _idx_jj].squeeze(2)  # (1, C, N_b)
+                    _lat_jj = self._unpack_latents(
+                        _lat_jj.permute(0, 2, 1), h_b * 2, h_b * 2, 1)  # (1, C, H_b, W_b)
+                    _vae_inputs.append(_lat_jj.to(self.vae.dtype))
 
-                ### Dynamic Latent Sampling ###
-                indices_new, weight = SphericalFunctions.dynamic_laetent_sampling(
-                    spherical_points, cur_view_dir, num_points_on_sphere, _fov,
-                    temperature=weighted_average_temperature, center_first=False,
-                )
-                cur_latent_height = round(indices_new.shape[-1]**0.5)
+                _vae_input_batch = torch.cat(_vae_inputs, dim=0)  # (K_b, C, H_b, W_b)
+                images_batch = self.vae.decode(
+                    _vae_input_batch / self.vae.config.scaling_factor, return_dict=False)[0]  # (K_b, C, H_b, W_b)
 
-                _latents = latents[..., indices_new].squeeze(2)  # (B, C, F, N)
-                _latents = self._unpack_latents(_latents.permute(0, 2, 1), cur_latent_height * 2, cur_latent_height * 2, 1)
-                _latents = _latents.unsqueeze(dim=2)
+                # Paste each decoded view into the ERP canvas
+                for _k, _jj in enumerate(_batch):
+                    _image_k = images_batch[_k:_k + 1].unsqueeze(2)  # (1, C, 1, H_b, W_b)
+                    _cur_view_dir = view_dir[_jj].repeat(batch_size, 1)
+                    _fov_vae = view_fovs[_jj]  # P0 bugfix + P2 anisotropic FOV
+                    wb, wb_cnt = SphericalFunctions.paste_perspective_to_erp_rectangle(
+                        wb, _image_k.to(wb.device, wb.dtype),
+                        _cur_view_dir.to(wb.device, wb.dtype), fov=_fov_vae,
+                        add=True, interpolate=True, interpolation_mode='bilinear',
+                        panorama_cnt=wb_cnt, return_cnt=True,
+                        temperature=temperatures_per_view[_jj],  # P1 adaptive
+                    )
 
-                _latents = _latents.to(self.vae.dtype)
-                _latents = _latents[:, :, 0, :, :]  # (B, C, H, W)
-
-                image = self.vae.decode(_latents / self.vae.config.scaling_factor, return_dict=False)[0]
-
-                image = image.unsqueeze(2)  # (B, C, 1, H, W)
-
-                # save image separately
-                wb, wb_cnt = SphericalFunctions.paste_perspective_to_erp_rectangle(
-                    wb, image.to(wb.device, wb.dtype), cur_view_dir.to(wb.device, wb.dtype), fov=fov_vae,
-                    add=True, interpolate=True, interpolation_mode='bilinear',
-                    panorama_cnt=wb_cnt, return_cnt=True, temperature=weighted_average_temperature,
-                )
-
-                progress_bar.update()
+                progress_bar.update(K_b)
 
         wb_cnt[wb_cnt == 0] = 1
         wb /= wb_cnt
